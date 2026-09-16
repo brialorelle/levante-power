@@ -724,32 +724,36 @@ icc_labels <- c(estimate = sprintf("ICC estimate (%.2f)", icc_values[["estimate"
                 ci_low   = sprintf("ICC 95%% CI low (%.2f)", icc_values[["ci_low"]]),
                 ci_high  = sprintf("ICC 95%% CI high (%.2f)", icc_values[["ci_high"]]))
 
-# prepare the plot data: add the readable ICC name, ordered low, estimate, high
+# prepare the plot data: add the readable ICC name, ordered high, estimate, low
+# (a higher ICC gives a smaller detectable effect, so this orders the lines top to bottom)
 plot_data <- power_table |>
   mutate(icc_label = factor(icc_labels[icc_used],
                             levels = icc_labels[c("ci_low", "estimate", "ci_high")]))
 
+# how many months of vocabulary growth one unit on the y axis is worth, used for the second axis:
+# an effect of 1 SD per year equals this many months of ordinary growth per year
+months_per_sd_year <- 12 * within_age_sd / average_growth_logits
+
 # draw the plot layer by layer:
-# a dashed horizontal line at 80% power;
-# a line and points for each ICC value, shifted slightly sideways so the error bars do not overlap;
-# vertical error bars showing the 95% interval of each simulated power;
+# a line and points for each ICC value;
 # a label at the right-hand end of each line naming the ICC value;
-# fixed colours, the y axis from 0.4 to 1, extra room on the right for the labels, and axis labels with units
-dodge <- position_dodge(width = 6)
-ggplot(plot_data, aes(n, power, colour = icc_label, group = icc_label)) +
-  geom_hline(yintercept = target_power, linetype = "dashed", colour = "grey40") +
-  geom_line(position = dodge) +
-  geom_point(position = dodge, size = 2.5) +
-  geom_errorbar(aes(ymin = power_ci_low, ymax = power_ci_high), width = 0, position = dodge) +
+# fixed colours, breaks at the sample sizes compared, room on the right for the labels;
+# the left axis in SD per year and the right axis the same numbers as months of growth per year
+ggplot(plot_data, aes(n, smallest_effect_sd_per_year, colour = icc_label, group = icc_label)) +
+  geom_line() +
+  geom_point(size = 2.5) +
   geom_text(data = filter(plot_data, n == max(n_enrolled)),
             aes(label = icc_label), hjust = 0, nudge_x = 8, size = 3.2, show.legend = FALSE) +
   scale_colour_manual(values = c("#eb6834", "#2a78d6", "#1baf7a")) +
   scale_x_continuous(breaks = n_enrolled, expand = expansion(mult = c(0.05, 0.45))) +
-  scale_y_continuous(limits = c(0.4, 1)) +
+  scale_y_continuous(
+    limits = c(0, NA),
+    sec.axis = sec_axis(~ . * months_per_sd_year,
+                        name = "Extra months of vocabulary growth per year")) +
   labs(x = "Children enrolled at wave 1 (count)",
-       y = "Power to detect growth effect of .08 SD/year (probability)",
+       y = "Smallest detectable effect at 80% power\n(SD of Vocabulary score per year, per SD of the index)",
        colour = NULL,
-       caption = "Points: simulated power (1000 simulations each). Bars: 95% interval. Dashed line: 80% power.") +
+       caption = "Effects smaller than the line cannot be reliably detected. Derived from simulated power (1000 simulations per point).") +
   theme_minimal() +
   theme(legend.position = "top")
 ```
@@ -933,6 +937,20 @@ was β = `r fmt(row_360$smallest_effect_sd_per_year, 3)` SD/year
   not estimates.
 - Simulated power has its own uncertainty: with 1000 simulations, about ±0.03
   (the 95% intervals are shown in the table).
+
+# Proposal text
+
+Pasted from the proposal draft, as written.
+
+> Our primary analyses are longitudinal multilevel growth models relating measures of environmental predictability and heterogeneity to the level and rate of change of LEVANTE measurement scores at baseline and across three annual waves.
+>
+> First, we describe the novel composite indexes. We will construct composite indices for heterogeneity and predictability using the caregiver surveys and EMA data from each wave. We will construct a domain-general index as our primary pre-registered comparison, with domain-specific linguistic and social indexes as secondary comparisons. The overall heterogeneity index will incorporate the number and diversity of settings, social partners, and languages a child regularly experiences, including cross-border contexts and language mixing. The predictability index will incorporate data on the places, people, languages, and activities children encounter on a day-to-day timescale. We will confirm that the two indices are only modestly correlated so that their effects can be separated. Each index will be standardized within our sample and entered as a continuous predictor of the level and rate of change of LEVANTE scores. Head-mounted videos will be used to validate these indices against denser and direct measurement in the home, and for follow-up analyses. To limit multiple comparisons, we will preregister one primary LEVANTE outcome per index and apply FDR correction to secondary outcomes and to the learning-strategy measures. As these are novel indexes that still need to be assessed for their reliability and validity, we do not have a strong a priori effect size estimate. Thus, we conducted a simulation using the smallest-effect-size-of-interest (SESOI) framework. Our goal was to ensure that a primary comparison where we relate an index of variability to LEVANTE outcome data would be adequately powered for a modest-sized effect.
+>
+> We downloaded LEVANTE pilot data from (https://stanford.redivis.com/datasets/68kn-csrddrz5x) to estimate how reliable LEVANTE outcome tasks are across age. While there is considerable variability across tasks, here we use estimates derived from the Vocabulary task given both data density in the pilot sample and PI Long's familiarity with the task. Vocabulary assessment will be given to children in the language of their choice (Spanish or English), with the option to complete both assessments.
+>
+> We estimated the test-retest reliability in the Leipzig sample at r=.75 with an ICC of .46 across all ages by fitting a linear-mixed effect model. We then simulated a multilevel longitudinal growth model using these estimates. With 300 children enrolled, we estimated that the design has 80% power to detect a growth-rate effect of β = .094 SD/year. That is, children 1 SD apart on a given environmental index would need to diverge by at least 0.19 SD on the Vocabulary IRT ability score between Wave 1 and Wave 3, beyond any difference present at baseline. Thus, these results suggest that a final N=300 would allow enough power to detect moderate influences on a common LEVANTE task.
+>
+> There are, of course, several caveats to the estimates above: (1) the LEVANTE Vocabulary administrations were slightly different on each administration and given several months apart to this cohort (rather than one to two years), meaning that the true ICC could differ, (2) other tasks with higher ICC's (e.g., Math) or lower ICC's could result in different levels of observed power. Prior to collecting data, we will thus run updated power analyses for each specific task with all available LEVANTE data and our simulated constructs to better understand our power to detect specific effect sizes with our projected sample sizes. These power analyses will be conducted prior to and included in all pre-registrations. Acknowledgments: Claude code was used to aid with and verify simulation results.
 
 # Session info
 
