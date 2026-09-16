@@ -1,0 +1,7 @@
+data/
+.Rproj.user/
+.Rhistory
+.RData
+.DS_Store
+vocab_icc_cache/
+vocab_icc_files/

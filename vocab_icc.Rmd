@@ -1,0 +1,941 @@
+---
+title: "Vocabulary ICC and power for the border cohort"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+This document estimates how much of the variation in LEVANTE Vocabulary scores
+is stable between children of the same age (the ICC), and uses it to calculate
+power for a three-wave longitudinal study relating an environmental index to
+the growth of Vocabulary scores.
+
+What comes from data and what is assumed:
+
+| Quantity | Source |
+|---|---|
+| ICC of Vocabulary scores at a fixed age | Estimated here, from LEVANTE pilot data (Leipzig) |
+| Within-age SD of Vocabulary scores | Estimated here |
+| Average yearly growth in Vocabulary scores | Estimated here |
+| Target effect, β = .08 SD/year | Chosen (proposal) |
+| Between-child SD of growth rates, .15 SD/year | Assumed |
+| Three annual waves, 20% attrition by wave 3, α = .05 | Design assumptions |
+
+```{r setup, message = FALSE}
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(lme4)
+library(simr)
+
+# fix the random seed so bootstrap intervals are identical on every run
+seed <- 20260914
+set.seed(seed)
+cat("Random seed:", seed, "\n")
+```
+
+# Data
+
+## Download
+
+The scores table comes from the public LEVANTE pilot release on Redivis
+(`levante_data_pilots`, current version). Access needs a Redivis account, the
+signed LEVANTE data use agreement, and an API token with the `data.data` scope
+saved in `~/.Renviron` as `REDIVIS_API_TOKEN`. This chunk only runs if
+`data/scores.csv` is not already saved.
+
+```{r download, eval = !file.exists("data/scores.csv")}
+# qualified Redivis reference: owner.dataset:id:version.table:id
+table_ref <- "levante.levante_data_pilots:68kn:current.scores:pgms"
+url <- paste0("https://redivis.com/api/v1/tables/", table_ref, "/rows?format=csv")
+
+token <- Sys.getenv("REDIVIS_API_TOKEN")
+if (token == "") stop("Set REDIVIS_API_TOKEN in ~/.Renviron and restart R.")
+
+# build the request, attach the token, and write the response straight to a CSV file
+dir.create("data", showWarnings = FALSE)
+httr2::request(url) |>
+  httr2::req_headers(Authorization = paste("Bearer", token)) |>
+  httr2::req_perform(path = "data/scores.csv")
+```
+
+## Load and filter
+
+```{r load}
+# read the full scores table (all tasks, all pilot sites)
+scores <- read_csv("data/scores.csv", show_col_types = FALSE)
+
+# record which data this document was run on
+cat("File downloaded:", format(file.mtime("data/scores.csv"), "%Y-%m-%d"), "\n")
+cat("Rows in scores table:", nrow(scores), "\n")
+```
+
+```{r filter}
+# keep Vocabulary runs, then runs without an exclusion flag, then runs with a score
+vocab_all    <- filter(scores, task_id == "vocab")
+vocab_scored <- filter(vocab_all, is.na(exclusion))
+vocab        <- filter(vocab_scored, !is.na(score))
+
+# how many runs survive each step
+tibble(step = c("Vocabulary runs", "no exclusion flag", "has a score"),
+       runs = c(nrow(vocab_all), nrow(vocab_scored), nrow(vocab)))
+
+# reasons runs were excluded
+count(vocab_all, exclusion)
+```
+
+## Which sites have children tested more than once?
+
+```{r sites}
+# one row per child: number of scores and age at first test
+kids <- vocab |>
+  group_by(dataset, user_id) |>
+  summarise(n_scores = n(), first_age = min(age), .groups = "drop")
+
+# per site: children, retested children, missing ages, and age range at first test
+kids |>
+  group_by(dataset) |>
+  summarise(children = n(),
+            retested = sum(n_scores >= 2),
+            missing_age = sum(is.na(first_age)),
+            youngest = round(min(first_age, na.rm = TRUE), 1),
+            oldest = round(max(first_age, na.rm = TRUE), 1))
+```
+
+Only Leipzig (`pilot_mpieva_de_main`) has enough retested children with
+recorded ages, so all estimates below use Leipzig.
+
+## The Leipzig sample
+
+```{r leipzig}
+# Leipzig Vocabulary scores with a recorded age, ordered by child and then by age
+leipzig <- vocab |>
+  filter(dataset == "pilot_mpieva_de_main", !is.na(age)) |>
+  arrange(user_id, age)
+
+# summarise within each child first
+leipzig_kids <- leipzig |>
+  group_by(user_id) |>
+  summarise(n_scores = n(), first_age = min(age), .groups = "drop")
+
+# then describe the sample across children
+leipzig_kids |>
+  summarise(children = n(),
+            scores = sum(n_scores),
+            one_score = sum(n_scores == 1),
+            two_scores = sum(n_scores == 2),
+            three_or_more = sum(n_scores >= 3),
+            youngest = round(min(first_age), 1),
+            median_age = round(median(first_age), 1),
+            oldest = round(max(first_age), 1))
+
+# scoring model and test version behind these scores
+count(leipzig, scoring_model, registry_version, score_type, language)
+count(leipzig, adaptive)
+```
+
+`score` is an IRT ability estimate from a Rasch model fitted to German-language
+Vocabulary responses, in logits.
+
+## Retest pairs and a scoring check
+
+LEVANTE Vocabulary scores were affected by a scoring bug, since fixed. For
+Leipzig retest pairs, the LEVANTE longitudinal analyses report a slope of T2
+on T1 of .15 with the buggy scores and .62 with corrected scores, and mean
+change of −.91 vs .00 logits. Values near the corrected ones confirm these
+are corrected scores.
+
+```{r pairs}
+# one row per retested child: first and second score, versions, and the gap between tests
+pairs <- leipzig |>
+  group_by(user_id) |>
+  filter(n() >= 2) |>
+  summarise(age_t1 = age[1], age_t2 = age[2],
+            t1 = score[1], t2 = score[2],
+            adaptive_t1 = adaptive[1], adaptive_t2 = adaptive[2],
+            gap_months = 12 * (age[2] - age[1]),
+            .groups = "drop")
+
+# retest summaries across children (each child contributes one pair)
+pairs |>
+  summarise(children = n(),
+            median_gap_months = median(gap_months),
+            min_gap_months = min(gap_months),
+            max_gap_months = max(gap_months),
+            retest_r = cor(t1, t2),
+            slope_t2_on_t1 = coef(lm(t2 ~ t1))[2],
+            mean_change_logits = mean(t2 - t1)) |>
+  print(width = Inf)
+
+# test version at first and second test
+count(pairs, adaptive_t1, adaptive_t2)
+```
+
+```{r pairs-plot, fig.width = 6.5, fig.height = 4.5}
+# first vs second score for each retested child; dashed line = identical scores
+ggplot(pairs, aes(t1, t2, colour = age_t1)) +
+  geom_point() +
+  geom_abline(linetype = "dashed") +
+  labs(x = "Vocabulary score at first test (IRT ability, logits)",
+       y = "Vocabulary score at second test (IRT ability, logits)",
+       colour = "Age at first test (years)")
+```
+
+```{r age-plot, fig.width = 6.5, fig.height = 4.5}
+# every Leipzig score against age, with the smooth age curve used in the ICC model
+ggplot(leipzig, aes(age, score)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", formula = y ~ splines::ns(x, df = 3), colour = "black") +
+  labs(x = "Age at test (years)",
+       y = "Vocabulary score (IRT ability, logits)")
+```
+
+# ICC at a fixed age
+
+## Model
+
+$$
+\text{score}_{ij} = f(\text{age}_{ij}) + \gamma\,\text{adaptive}_{ij} + u_i + e_{ij},
+\qquad u_i \sim N(0, \tau^2), \quad e_{ij} \sim N(0, \sigma^2)
+$$
+
+for child *i* at test *j*. $f$ is a natural spline in age with 3 degrees of
+freedom, which removes the average age trend. `adaptive` shifts scores from the
+adaptive version of the task. $u_i$ is each child's stable deviation from
+same-age peers; $e_{ij}$ is everything that differs from test to test
+(measurement error plus real fluctuation). The ICC is
+
+$$
+\text{ICC} = \frac{\tau^2}{\tau^2 + \sigma^2}.
+$$
+
+Children with one score contribute to the age curve and to the total
+variance; children with two scores separate $\tau^2$ from $\sigma^2$.
+
+```{r icc-model}
+# fit the model by REML
+icc_model <- lmer(score ~ splines::ns(age, df = 3) + adaptive + (1 | user_id),
+                  data = leipzig, REML = TRUE)
+summary(icc_model)
+```
+
+```{r icc-components}
+# pull the two variance components out of the fitted model
+variance_components <- as.data.frame(VarCorr(icc_model))
+child_var    <- variance_components$vcov[variance_components$grp == "user_id"]
+residual_var <- variance_components$vcov[variance_components$grp == "Residual"]
+
+# ICC and the SD of scores among children of the same age
+icc_estimate  <- child_var / (child_var + residual_var)
+within_age_sd <- sqrt(child_var + residual_var)
+
+tibble(child_variance = child_var,
+       residual_variance = residual_var,
+       icc = icc_estimate,
+       within_age_sd_logits = within_age_sd)
+```
+
+## How much of the residual is measurement error?
+
+Each score has a standard error from the IRT model. Its square is the
+measurement error variance of that score.
+
+```{r measurement-error}
+# average squared standard error within each child, then across children
+error_var <- leipzig |>
+  group_by(user_id) |>
+  summarise(child_mean_se2 = mean(score_se^2), .groups = "drop") |>
+  summarise(mean_se2 = mean(child_mean_se2)) |>
+  pull(mean_se2)
+
+tibble(residual_variance = residual_var,
+       measurement_error_variance = error_var,
+       share_of_residual = error_var / residual_var)
+```
+
+What this means, in plain terms. Each Vocabulary score comes with a standard
+error from the IRT model: how precisely that one test pins down the child's
+ability. Squared and averaged, it says how much scores would bounce around from
+test to test from imprecision alone (`r round(error_var, 3)`). That is about the
+same size as the test-to-test variance in the ICC model (`r round(residual_var, 3)`).
+
+So when a child's score changes between two tests a few months apart, the change
+is about what imprecision alone would produce. There is no sign that children's
+vocabulary, relative to same-age peers, actually shifts over those months. The two
+numbers come from different calculations and are both approximate, so their ratio
+being a little above 1 means "about equal", nothing more.
+
+The practical consequence: children's relative vocabulary level is stable, but one
+score measures it imprecisely. Among children of the same age, a single score's
+reliability is roughly the ICC (`r round(icc_estimate, 2)`). This imprecision is
+already built into the ICC, and so into the power calculations below. It also means
+an observed association with the environmental index will be weaker than the true
+one, which is a reason to consider averaging several language tasks into one outcome.
+
+## Bootstrap confidence intervals
+
+Parametric bootstrap: simulate 500 new datasets from the fitted model, refit
+each, recompute the ICC, and take the 2.5th and 97.5th percentiles. This is
+done for all ages and for children aged 9 and under at the time of testing.
+
+```{r icc-functions}
+# fit the ICC model to any subset of the data
+fit_icc <- function(d) {
+  lmer(score ~ splines::ns(age, df = 3) + adaptive + (1 | user_id), data = d, REML = TRUE)
+}
+
+# ICC from a fitted model: child variance / (child variance + residual variance)
+icc_from_model <- function(m) {
+  v <- as.data.frame(VarCorr(m))
+  v$vcov[v$grp == "user_id"] / sum(v$vcov)
+}
+
+# point estimate plus a parametric bootstrap interval; the seed is reset so each call is reproducible
+icc_with_ci <- function(d, label, n_boot = 500) {
+  m <- fit_icc(d)
+  set.seed(seed)
+  boot <- bootMer(m, icc_from_model, nsim = n_boot, type = "parametric")
+  tibble(ages = label,
+         children = n_distinct(d$user_id),
+         retested = sum(table(d$user_id) >= 2),
+         icc = icc_from_model(m),
+         ci_low = unname(quantile(boot$t, 0.025)),
+         ci_high = unname(quantile(boot$t, 0.975)))
+}
+```
+
+```{r icc-bootstrap, warning = FALSE}
+# ICC with intervals, all ages and ages 9 and under
+icc_results <- bind_rows(
+  icc_with_ci(leipzig, "all ages"),
+  icc_with_ci(filter(leipzig, age <= 9), "ages 9 and under")
+)
+icc_results
+```
+
+## Does the age range change the ICC?
+
+Without age in the model, older children outscore younger ones at every test,
+so age differences look like stable child differences and inflate the ICC.
+With age in the model, the ICC should not depend on the age range.
+
+```{r age-range}
+# ICC from a model with a given formula, fitted to a given subset
+simple_icc <- function(d, formula) icc_from_model(lmer(formula, data = d, REML = TRUE))
+
+no_age_formula     <- score ~ adaptive + (1 | user_id)
+spline_age_formula <- score ~ splines::ns(age, df = 3) + adaptive + (1 | user_id)
+
+# attach each child's age at first test, used to form age bands
+leipzig_banded <- left_join(leipzig, select(leipzig_kids, user_id, first_age), by = "user_id")
+under_9 <- filter(leipzig, age <= 9)
+
+tibble(
+  sample = c("all ages", "all ages", "ages 9 and under", "ages 9 and under"),
+  age_in_model = c("no", "yes", "no", "yes"),
+  age_sd_years = c(sd(leipzig$age), sd(leipzig$age), sd(under_9$age), sd(under_9$age)),
+  icc = c(simple_icc(leipzig, no_age_formula), simple_icc(leipzig, spline_age_formula),
+          simple_icc(under_9, no_age_formula), simple_icc(under_9, spline_age_formula))
+)
+
+# within two-year bands of age at first test, with a linear age term
+band_formula <- score ~ age + adaptive + (1 | user_id)
+bands <- list("5 to 7" = c(0, 7), "7 to 9" = c(7, 9), "9 to 11" = c(9, 11), "11 and over" = c(11, Inf))
+
+# for each band: keep children whose first test falls in it, then fit the model
+bind_rows(lapply(names(bands), function(b) {
+  d <- filter(leipzig_banded, first_age >= bands[[b]][1], first_age < bands[[b]][2])
+  tibble(band = b,
+         children = n_distinct(d$user_id),
+         retested = sum(table(d$user_id) >= 2),
+         icc = simple_icc(d, band_formula))
+}))
+```
+
+The bands have only 30–50 retested children each, so their ICCs are noisy.
+
+# Does the retest gap matter?
+
+The Leipzig children were retested a median of 3.6 months apart, but the border
+study would test children a year apart. If children's standing drifts over a
+year in ways a straight growth line does not capture, that drift counts as
+test-to-test noise in an annual study, and the ICC estimated from short gaps
+would be too high.
+
+Two pilot sites differ in their retest gaps: Leipzig at 3.6 months and Bogotá at
+15.6 months. Comparing them across all tasks with enough retested children gives
+a rough sense of how much the gap matters. The comparison is imperfect: site,
+language, sample and testing conditions differ alongside the gap.
+
+```{r gap-comparison}
+# all tasks at all sites, keeping runs that were scored and have an age
+all_tasks <- read_csv("data/scores.csv", show_col_types = FALSE) |>
+  filter(is.na(exclusion), !is.na(score), !is.na(age), abs(score) < 8)
+
+# site and task combinations with at least 30 retested children
+cells <- all_tasks |>
+  group_by(dataset, task_id) |>
+  summarise(children = n_distinct(user_id), retested = sum(table(user_id) >= 2), .groups = "drop") |>
+  filter(retested >= 30)
+
+# fit the same kind of ICC model in each cell and record the median retest gap:
+# lapply walks through the cells, fits the model, and returns one row per cell;
+# bind_rows stacks those rows into a table
+gap_table <- bind_rows(lapply(seq_len(nrow(cells)), function(i) {
+
+  d <- filter(all_tasks, dataset == cells$dataset[i], task_id == cells$task_id[i])
+
+  # the gap between the first two tests for each retested child
+  gaps <- d |>
+    group_by(user_id) |>
+    filter(n() >= 2) |>
+    arrange(age, .by_group = TRUE) |>
+    summarise(gap = 12 * (age[2] - age[1]), .groups = "drop")
+
+  # include the version term only where both versions appear in the cell
+  f <- if (n_distinct(d$adaptive) > 1) {
+    score ~ splines::ns(age, df = 3) + adaptive + (1 | user_id)
+  } else {
+    score ~ splines::ns(age, df = 3) + (1 | user_id)
+  }
+
+  model <- lmer(f, data = d)
+
+  tibble(site = gsub("^pilot_|_main$", "", cells$dataset[i]),
+         task = cells$task_id[i],
+         retested = cells$retested[i],
+         gap_months = round(median(gaps$gap), 1),
+         icc = round(icc_from_model(model), 3))
+}))
+
+# show the cells, shortest gaps first
+gap_table |> arrange(gap_months, site, task) |> print(n = Inf)
+
+# the typical ICC at each gap length
+gap_table |>
+  mutate(gap_group = ifelse(gap_months < 9, "short gaps (3-5 months)", "annual gaps (15-17 months)")) |>
+  group_by(gap_group) |>
+  summarise(cells = n(), median_icc = round(median(icc), 3))
+```
+
+```{r gap-paired}
+# compare the same task across the two sites, in steps:
+# select keeps the three columns needed; pivot_wider puts each site in its own column;
+# filter keeps tasks measured at both sites; mutate computes the ratio of the two ICCs
+gap_table |>
+  select(site, task, icc) |>
+  tidyr::pivot_wider(names_from = site, values_from = icc) |>
+  filter(!is.na(mpieva_de), !is.na(uniandes_co_bogota)) |>
+  mutate(ratio = round(uniandes_co_bogota / mpieva_de, 2)) |>
+  rename(leipzig_3.6_months = mpieva_de, bogota_15.6_months = uniandes_co_bogota)
+```
+
+Bogotá's Vocabulary cell is too thin to include here (29 retested children). Its
+ICC comes out at .12, but that rests on a handful of children whose scores moved
+2 to 3 logits, and the retest correlation rises to .55 if the three largest
+movers are dropped. Bogotá's wave-1 Vocabulary runs also attempted far fewer
+items than Leipzig's (a median of 49 against 115), so those scores are less
+precise. It sits well below Bogotá's own better-measured tasks (math .58, mental
+rotation .55).
+
+What this suggests: stability at annual gaps is somewhat lower than at three
+months, with the typical ICC falling from about .46 to about .35 across tasks,
+rather than collapsing. The ICC used above (`r round(icc_estimate, 2)`) is
+therefore probably a little optimistic for an annual design, and the lower end of
+its confidence interval (`r round(icc_results$ci_low[icc_results$ages == "all ages"], 2)`) is a reasonable
+stand-in for the annual case. Because site and gap are confounded here, this
+bounds the problem rather than settling it.
+
+# Average growth in Vocabulary scores
+
+Used only to put the effect size in context. Two estimates:
+
+- **Within children**: each retested child's change divided by the time between
+  tests, averaged across children. Every retested Leipzig child took the
+  non-adaptive version first and the adaptive version second, so this change
+  also contains any difference between versions, and short gaps make each
+  child's yearly rate noisy.
+- **Across ages**: the slope of score on age, using each child's first score.
+  This is not affected by the version switch, and it is the estimate used below.
+
+```{r average-growth}
+# within children: change per year for each retested child, then summarised across children
+within_child_growth <- pairs |>
+  mutate(change_per_year = (t2 - t1) / (gap_months / 12)) |>
+  summarise(children = n(),
+            mean_logits_per_year = mean(change_per_year),
+            median_logits_per_year = median(change_per_year))
+within_child_growth
+
+# across ages: keep each child's earliest score, then regress score on age
+first_scores <- leipzig |>
+  group_by(user_id) |>
+  slice_min(age, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+age_slope_model <- lm(score ~ age + adaptive, data = first_scores)
+average_growth_logits <- coef(age_slope_model)[["age"]]
+age_slope_ci <- confint(age_slope_model, "age")
+
+tibble(children = nrow(first_scores),
+       age_slope_logits_per_year = average_growth_logits,
+       ci_low = age_slope_ci[1],
+       ci_high = age_slope_ci[2],
+       age_slope_sd_per_year = average_growth_logits / within_age_sd)
+```
+
+# Power for the border cohort
+
+## Approach
+
+Power is estimated by simulation with the **simr** package (Green & MacLeod,
+2016, *Methods in Ecology and Evolution*). The steps:
+
+- Build an artificial version of the study: the children, the waves at which
+  each child is tested, who drops out, and each child's environmental index score.
+- Write down the analysis model and fill in its values: the ICC estimated
+  above, the assumed spread of growth rates, and the growth effect to detect.
+- simr generates Vocabulary scores for that study from the model, fits the
+  model to them with `lmer`, and tests the index × time effect. It does this
+  many times.
+- Power is the share of simulated studies in which the index × time effect is
+  significant at α = .05.
+
+## The model
+
+For child *i* at wave *j* (time $t_{ij}$ = 0, 1 or 2 years after the first test):
+
+$$
+y_{ij} = b_0 + u_{0i} + (b_1 + u_{1i})\,t_{ij} + \beta_{\text{level}} X_i + \beta_{\text{growth}} X_i t_{ij} + e_{ij}
+$$
+
+- $y_{ij}$ is the child's Vocabulary score at that wave, in units of the
+  within-age SD estimated above (logits divided by that SD, not re-standardized
+  at each wave, so growth is kept).
+- $b_0$ is the average starting score (set to 0; it does not affect power) and
+  $b_1$ is the average yearly growth (the age slope estimated above, in SD per year).
+- $u_{0i}$ is how far child *i* starts above or below average; its variance is the ICC.
+- $u_{1i}$ is how much faster or slower than average child *i* grows; its SD is
+  the assumed growth SD. Starting level and growth rate are assumed uncorrelated.
+- $e_{ij}$ is test-to-test noise, with variance 1 − ICC, so a single first-wave
+  score has total variance 1.
+- $X_i$ is the child's environmental index, standardized (mean 0, SD 1).
+- $\beta_{\text{level}}$ is set to 0: it is not the effect being tested, and it
+  does not change power for the growth effect.
+- $\beta_{\text{growth}}$ is the tested effect: extra growth per year, in SD,
+  for each SD of the index.
+
+In `lmer` notation this is `y ~ time * index + (1 + time | child)`.
+
+## Settings
+
+```{r power-settings}
+# the three enrolment sizes being compared; the L stores them as whole numbers (integers),
+# so they can be matched exactly later without comparing decimal numbers
+n_enrolled <- c(300L, 320L, 360L)
+
+# the share of enrolled children still being tested at wave 1, wave 2 and wave 3:
+# everyone at wave 1, 90% at wave 2 (10% lost), 80% at wave 3 (20% lost in total)
+retention <- c(1.00, 0.90, 0.80)
+
+# how much children differ in their yearly growth rate, as an SD in within-age SD units per year;
+# this is an assumption, not estimated from the pilot data
+growth_sd <- 0.15
+
+# average yearly growth in within-age SD units: the age slope in logits divided by the within-age SD;
+# it sets b1 in the model, which makes the simulated scores realistic but does not change power
+average_growth_sd <- average_growth_logits / within_age_sd
+
+# the significance threshold for a two-sided test
+alpha <- 0.05
+
+# the power we want the study to have (an 80% chance of detecting a true effect)
+target_power <- 0.80
+
+# the growth effect whose power we estimate: 0.08 SD of extra Vocabulary growth per year
+# for each 1 SD higher on the environmental index
+target_effect <- 0.08
+
+# the number of simulated studies for each setting in the main table; with 1000 simulations
+# a power near .75 is estimated to within about ±0.03 (95% interval)
+n_sims <- 1000
+
+# fewer simulations for the sensitivity table, which is only there to show the direction of change
+n_sims_sensitivity <- 500
+
+# the ICC estimate and its 95% interval from the bootstrap above, stored with names so each can be looked up
+icc_all <- filter(icc_results, ages == "all ages")
+icc_values <- c(estimate = icc_all$icc, ci_low = icc_all$ci_low, ci_high = icc_all$ci_high)
+icc_values
+```
+
+## Building the simulated study
+
+```{r power-design}
+# make_design() builds the explanatory data for one study with n enrolled children:
+# one row per test actually taken, with the child's id, the time of the test in years,
+# and the child's environmental index score (no Vocabulary scores yet; simr adds those)
+make_design <- function(n) {
+
+  # reset the random seed so the same index scores and dropout pattern are produced every time
+  set.seed(seed)
+
+  # how many children are last tested at wave 1, wave 2 and wave 3:
+  # -diff(retention) is c(0.10, 0.10), the shares lost after waves 1 and 2, and retention[3] is the
+  # 0.80 who complete all three; multiplying by n and rounding turns shares into counts
+  n_last_wave <- round(n * c(-diff(retention), retention[3]))
+
+  # stop with an error if rounding made the counts add up to something other than n
+  stopifnot(sum(n_last_wave) == n)
+
+  # one row per child:
+  # child is an id stored as a factor, because lmer groups rows by it;
+  # index is drawn from a normal distribution, then scale() makes its mean exactly 0 and SD exactly 1;
+  # last_wave repeats 1, 2 and 3 as many times as the counts above, then sample() shuffles them across children
+  children <- tibble(
+    child = factor(seq_len(n)),
+    index = as.numeric(scale(rnorm(n))),
+    last_wave = sample(rep(1:3, times = n_last_wave))
+  )
+
+  # expand to one row per test in steps:
+  # crossing gives every child a row for each time 0, 1 and 2;
+  # filter then drops the waves after each child's last test (time 0 is wave 1, so a child whose
+  # last wave is 2 keeps times 0 and 1)
+  children |>
+    tidyr::crossing(time = 0:2) |>
+    filter(time < last_wave)
+}
+
+# look at the design for N = 360: how many children are tested at each time point
+# (count() tallies the rows at each value of time)
+make_design(360L) |>
+  count(time, name = "children_tested")
+```
+
+```{r power-model}
+# make_model() builds an artificial lmer model with the effects and variances filled in,
+# for a given design, ICC, growth effect and growth SD
+make_model <- function(design, icc, effect = target_effect, slope_sd = growth_sd) {
+
+  # makeLmer() from simr creates a model object without any real Vocabulary data:
+  # formula is the analysis model;
+  # fixef gives the fixed effects in the order lmer lists them for this formula:
+  #   intercept (b0 = 0), time (b1 = average growth), index (beta level = 0), time:index (beta growth);
+  # VarCorr is the 2 x 2 covariance matrix of each child's own level and growth:
+  #   diagonal entries are the ICC and the growth SD squared, off-diagonal entries 0 (uncorrelated);
+  # sigma is the SD of test-to-test noise, the square root of 1 - ICC;
+  # data is the design built by make_design()
+  makeLmer(y ~ time * index + (1 + time | child),
+           fixef = c(0, average_growth_sd, 0, effect),
+           VarCorr = diag(c(icc, slope_sd^2)),
+           sigma = sqrt(1 - icc),
+           data = design)
+}
+
+# build the model for N = 360 at the ICC estimate and print what was filled in, to check it
+example_model <- make_model(make_design(360L), icc_values[["estimate"]])
+fixef(example_model)
+VarCorr(example_model)
+sigma(example_model)
+```
+
+```{r power-run-function}
+# run_power() simulates many studies for one setting and returns the estimated power
+run_power <- function(n, icc, slope_sd = growth_sd, nsim = n_sims) {
+
+  # build the study design and the model for this setting
+  model <- make_model(make_design(n), icc, slope_sd = slope_sd)
+
+  # powerSim() repeats nsim times: simulate Vocabulary scores from the model, refit
+  # y ~ time * index + (1 + time | child) with lmer, and test the time:index effect;
+  # fixed("time:index", "sa") picks that effect and the Satterthwaite t-test (from lmerTest);
+  # alpha is the significance threshold; seed makes the simulations reproducible;
+  # progress = FALSE hides the progress bar
+  sims <- powerSim(model,
+                   test = fixed("time:index", "sa"),
+                   nsim = nsim,
+                   alpha = alpha,
+                   seed = seed,
+                   progress = FALSE)
+
+  # summary() gives the number of significant results, the number of simulations,
+  # the power (their ratio), and a 95% interval for the power
+  result <- summary(sims)
+
+  # return one row: the setting, the power with its interval, and how many simulated fits
+  # produced a warning (usually a singular fit, when the growth-rate variance is estimated at 0)
+  # or an error
+  tibble(n = n,
+         icc = icc,
+         growth_sd = slope_sd,
+         simulations = nsim,
+         power = result$mean,
+         power_ci_low = result$lower,
+         power_ci_high = result$upper,
+         fits_with_warnings = length(unique(sims$warnings$index)),
+         fits_with_errors = length(unique(sims$errors$index)))
+}
+```
+
+## Power at each sample size
+
+This chunk runs `r 3 * 3` settings × `r n_sims` simulations and takes several
+minutes. It is cached, so it only reruns when its code or inputs change.
+
+```{r power-table, cache = TRUE, message = FALSE, warning = FALSE, cache.extra = list(icc_values, n_enrolled, retention, growth_sd, average_growth_sd, target_effect, n_sims, seed)}
+# every combination of sample size and ICC value (3 x 3 = 9 settings), in steps:
+# expand.grid makes the combinations; mutate looks up the numeric ICC for each name
+settings <- expand.grid(n = n_enrolled, icc_used = names(icc_values), stringsAsFactors = FALSE) |>
+  mutate(icc = icc_values[icc_used])
+
+# run the simulations for each setting in turn:
+# lapply goes through the row numbers of settings, runs run_power() for that row,
+# and adds a column saying which ICC value was used; bind_rows stacks the nine results into one table
+power_table <- bind_rows(lapply(seq_len(nrow(settings)), function(i) {
+  run_power(settings$n[i], settings$icc[i]) |>
+    mutate(icc_used = settings$icc_used[i], .before = icc)
+}))
+```
+
+The smallest effect detectable with 80% power is worked out from the simulated
+power. For a test like this, power ≈ Φ(β / SE − 1.96), where Φ is the normal
+cumulative distribution. Solving for the standard error gives
+SE = β / (Φ⁻¹(power) + 1.96), and the effect needed for 80% power is
+SE × (1.96 + 0.84).
+
+```{r power-smallest-effect}
+# add the smallest detectable effect to the table in steps:
+# implied_se is the standard error implied by the simulated power at the target effect;
+# smallest_effect_sd_per_year is that standard error times 1.96 + 0.84 (the z values for a two-sided
+# .05 test and for 80% power)
+power_table <- power_table |>
+  mutate(implied_se = target_effect / (qnorm(power) + qnorm(1 - alpha / 2)),
+         smallest_effect_sd_per_year = implied_se * (qnorm(1 - alpha / 2) + qnorm(target_power)))
+
+# show every column
+print(power_table, width = Inf)
+```
+
+```{r power-plot, fig.width = 7, fig.height = 4.5}
+# readable names for the three ICC values, used in the legend and the labels
+icc_labels <- c(estimate = sprintf("ICC estimate (%.2f)", icc_values[["estimate"]]),
+                ci_low   = sprintf("ICC 95%% CI low (%.2f)", icc_values[["ci_low"]]),
+                ci_high  = sprintf("ICC 95%% CI high (%.2f)", icc_values[["ci_high"]]))
+
+# prepare the plot data: add the readable ICC name, ordered low, estimate, high
+plot_data <- power_table |>
+  mutate(icc_label = factor(icc_labels[icc_used],
+                            levels = icc_labels[c("ci_low", "estimate", "ci_high")]))
+
+# draw the plot layer by layer:
+# a dashed horizontal line at 80% power;
+# a line and points for each ICC value, shifted slightly sideways so the error bars do not overlap;
+# vertical error bars showing the 95% interval of each simulated power;
+# a label at the right-hand end of each line naming the ICC value;
+# fixed colours, the y axis from 0.4 to 1, extra room on the right for the labels, and axis labels with units
+dodge <- position_dodge(width = 6)
+ggplot(plot_data, aes(n, power, colour = icc_label, group = icc_label)) +
+  geom_hline(yintercept = target_power, linetype = "dashed", colour = "grey40") +
+  geom_line(position = dodge) +
+  geom_point(position = dodge, size = 2.5) +
+  geom_errorbar(aes(ymin = power_ci_low, ymax = power_ci_high), width = 0, position = dodge) +
+  geom_text(data = filter(plot_data, n == max(n_enrolled)),
+            aes(label = icc_label), hjust = 0, nudge_x = 8, size = 3.2, show.legend = FALSE) +
+  scale_colour_manual(values = c("#eb6834", "#2a78d6", "#1baf7a")) +
+  scale_x_continuous(breaks = n_enrolled, expand = expansion(mult = c(0.05, 0.45))) +
+  scale_y_continuous(limits = c(0.4, 1)) +
+  labs(x = "Children enrolled at wave 1 (count)",
+       y = "Power to detect growth effect of .08 SD/year (probability)",
+       colour = NULL,
+       caption = "Points: simulated power (1000 simulations each). Bars: 95% interval. Dashed line: 80% power.") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+## Sensitivity to the assumed growth SD
+
+The between-child SD of growth rates cannot be estimated from these data: no
+child has more than two scores, and those are a few months apart. This table
+shows how much the answer depends on that assumption, at N = 360 and the ICC
+estimate, with `r n_sims_sensitivity` simulations each.
+
+```{r growth-sd-sensitivity, cache = TRUE, message = FALSE, warning = FALSE, cache.extra = list(icc_values, retention, average_growth_sd, target_effect, n_sims_sensitivity, seed)}
+# run the simulations once for each growth SD to try, then stack the results into one table:
+# lapply goes through the growth SDs and calls run_power() at N = 360 and the ICC estimate
+growth_sd_table <- bind_rows(lapply(c(0.05, 0.10, 0.15, 0.25), function(sd_value) {
+  run_power(360L, icc_values[["estimate"]], slope_sd = sd_value, nsim = n_sims_sensitivity)
+}))
+
+# show every column
+print(growth_sd_table, width = Inf)
+```
+
+More spread in growth rates makes the average growth rate harder to pin down,
+so power falls, but only modestly across this range.
+
+# What the effect sizes mean
+
+Effects here are in SD of Vocabulary score per year, for each SD of the
+environmental index. That is a difference in growth *rates*, so it accumulates:
+the gap between two children keeps widening as long as the study runs. The
+function below restates any such effect in easier terms.
+
+```{r effect-conversions}
+# describe_effect() restates a growth effect (in SD per year, per SD of the index) in other units
+describe_effect <- function(beta) {
+
+  # the same effect in logits per year: SD units times the within-age SD of Vocabulary scores
+  logits_per_year <- beta * within_age_sd
+
+  # how many months of ordinary vocabulary development that equals: the effect divided by
+  # how much scores rise with one year of age, times 12 months
+  months_per_year <- 12 * logits_per_year / average_growth_logits
+
+  # the gap between two children 1 SD apart on the index after two years (wave 1 to wave 3)
+  gap_by_wave_3 <- 2 * beta
+
+  # the SD of scores at wave 3: baseline variance 1, plus the spread added by two years of
+  # differing growth rates, plus the spread added by the index effect itself
+  wave_3_sd <- sqrt(1 + 4 * growth_sd^2 + 4 * beta^2)
+
+  tibble(
+    # the effect as given
+    effect_sd_per_year = beta,
+    # extra months of vocabulary growth per year, for a child 1 SD higher on the index
+    extra_months_per_year = months_per_year,
+    # the same, accumulated over the two years from wave 1 to wave 3
+    extra_months_by_wave_3 = 2 * months_per_year,
+    # Cohen's d at wave 3 for two children 1 SD apart on the index
+    cohens_d_1_sd_apart = gap_by_wave_3 / wave_3_sd,
+    # Cohen's d at wave 3 for the top half vs the bottom half of the index: the average index values
+    # of the two halves differ by 2 * sqrt(2 / pi), about 1.6 SD
+    cohens_d_median_split = 2 * sqrt(2 / pi) * gap_by_wave_3 / wave_3_sd,
+    # the correlation between the index and children's true growth rates
+    r_with_true_growth = beta / sqrt(beta^2 + growth_sd^2)
+  )
+}
+```
+
+## The effect we power for
+
+```{r target-effect-meaning}
+# restate the target effect of .08 SD/year in the other units
+describe_effect(target_effect) |> print(width = Inf)
+```
+
+Read the row like this: a child 1 SD higher on the environmental index gains
+about that many extra months of vocabulary development per year, and roughly
+twice that by the third wave. The Cohen's d columns compare children's scores
+at wave 3: first for two children 1 SD apart on the index, then for the top
+half against the bottom half of the index. By Cohen's rule of thumb, 0.2 is
+small.
+
+## The smallest effects each sample size can detect
+
+```{r smallest-effect-meaning}
+# restate each sample size's smallest detectable effect in the same units, in steps:
+# filter keeps the rows simulated at the ICC estimate (one per sample size);
+# lapply runs describe_effect() on each of those effects and bind_rows stacks the results;
+# the sample sizes are added back as the first column
+smallest_effects <- power_table |>
+  filter(icc_used == "estimate")
+
+bind_rows(lapply(smallest_effects$smallest_effect_sd_per_year, describe_effect)) |>
+  mutate(n = smallest_effects$n, .before = everything()) |>
+  print(width = Inf)
+```
+
+## Why these effects look small in SD but not in correlation
+
+Children's growth rates do not vary much: the assumed SD is
+`r growth_sd` SD/year. So an effect of `r target_effect` SD/year explains a
+sizeable share of the differences in how fast children learn vocabulary, which
+is why the correlation with true growth rates is around .5 even though Cohen's d
+is small. The d values are small because they compare scores at a single wave,
+where stable differences between children, which are much larger, dominate.
+
+# Reproducibility check
+
+Re-run the all-ages bootstrap with the same seed and confirm the result matches.
+
+```{r reproducibility, warning = FALSE}
+# repeat the bootstrap and compare with the first run, allowing only floating-point tolerance
+second_run <- icc_with_ci(leipzig, "all ages")
+identical_results <- isTRUE(all.equal(icc_all, second_run, tolerance = 1e-10))
+cat("Bootstrap results identical on re-run:", identical_results, "\n")
+```
+
+Re-run one simr setting (N = 360 at the ICC estimate) with the same seed and
+confirm the simulated power matches the table.
+
+```{r reproducibility-simr, message = FALSE, warning = FALSE}
+# simulate the N = 360, ICC estimate setting again
+repeat_run <- run_power(360L, icc_values[["estimate"]])
+
+# the same setting from the power table
+first_run <- filter(power_table, n == 360L, icc_used == "estimate")
+
+# compare the two powers, allowing only floating-point tolerance
+cat("simr power identical on re-run:",
+    isTRUE(all.equal(first_run$power, repeat_run$power, tolerance = 1e-12)), "\n")
+```
+
+# Methods summary
+
+```{r methods-numbers, include = FALSE}
+# numbers used in the text below
+fmt <- function(x, digits = 2) formatC(x, format = "f", digits = digits)
+n_children   <- nrow(leipzig_kids)
+n_scores     <- sum(leipzig_kids$n_scores)
+n_retested   <- sum(leipzig_kids$n_scores >= 2)
+gap_median   <- median(pairs$gap_months)
+row_360      <- filter(power_table, n == 360L, icc_used == "estimate")
+row_300      <- filter(power_table, n == 300L, icc_used == "estimate")
+```
+
+We estimated the between-child share of variance (ICC) in LEVANTE Vocabulary
+scores among children of the same age using the public LEVANTE pilot release.
+Leipzig was the only site with enough children tested twice: `r n_scores` scores
+from `r n_children` children aged `r fmt(min(leipzig$age), 1)`–`r fmt(max(leipzig$age), 1)` years,
+`r n_retested` of whom were retested a median of `r fmt(gap_median, 1)` months apart.
+Scores were IRT ability estimates (Rasch model, logits). We fitted a linear mixed
+model with a natural spline for age (3 df), a fixed effect of adaptive
+administration, and a random intercept for child (REML; lme4). The ICC was the
+child intercept variance divided by the sum of the intercept and residual
+variances, with a 95% interval from 500 parametric bootstrap refits. The ICC was
+`r fmt(icc_estimate)` (95% CI `r fmt(icc_all$ci_low)`–`r fmt(icc_all$ci_high)`).
+
+Power was estimated by simulation with simr (Green & MacLeod, 2016). Each
+simulated study enrolled N children tested at 0, 1 and 2 years, with 10% last
+tested at wave 1 and a further 10% at wave 2, and a standardized environmental
+index for each child. Vocabulary scores were generated from a growth model with a
+random intercept for each child (variance equal to the ICC), a random slope (SD
+`r fmt(growth_sd)` SD/year, uncorrelated with the intercept), residual variance
+1 − ICC, and an index × time effect of β = `r fmt(target_effect)` SD/year. Each
+simulated dataset was analysed with `lmer(y ~ time * index + (1 + time | child))`,
+and the index × time effect was tested with a Satterthwaite t-test (α = `r fmt(alpha)`),
+over `r n_sims` simulations per setting. With `r row_360$n` children enrolled, power was
+`r fmt(row_360$power)` (95% CI `r fmt(row_360$power_ci_low)`–`r fmt(row_360$power_ci_high)`),
+and the smallest effect detectable with 80% power, derived from the simulated power,
+was β = `r fmt(row_360$smallest_effect_sd_per_year, 3)` SD/year
+(`r row_300$n` children: `r fmt(row_300$smallest_effect_sd_per_year, 3)`).
+
+# Caveats
+
+- One site (Leipzig, German-language scores), ages 5–13. The border cohort is
+  4–8 and Spanish/English.
+- Retests were months apart, not a year, so the ICC reflects short-term stability.
+- Some children switched from the non-adaptive to the adaptive version between
+  tests; the model includes a version effect.
+- The growth SD (.15 SD/year) and the target effect (.08 SD/year) are assumptions,
+  not estimates.
+- Simulated power has its own uncertainty: with 1000 simulations, about ±0.03
+  (the 95% intervals are shown in the table).
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
