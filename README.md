@@ -82,4 +82,21 @@ the same seed and confirms the results match.
 - Bogotá has too few retested children on Vocabulary (29) to estimate its ICC
   reliably.
 
+## Data source and citation
+
+Analyses use the public LEVANTE pilot data release
+(<https://stanford.redivis.com/datasets/68kn-csrddrz5x>), licensed
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). No
+participant data are redistributed here: the figures and tables are derived
+summaries, and `data/` is git-ignored.
+
+- Frank, M. C., Baumgartner, H. A., Braginsky, M., Kachergis, G., et al. (2025).
+  Learning Variability Network Exchange (LEVANTE): A global framework for
+  measuring children's learning variability through collaborative data sharing.
+  *Child Development, 96*(6), 1867–1884. <https://doi.org/10.1111/cdev.70011>
+- Kachergis, G., O'Reilly, et al. (2025). Creation and validation of the LEVANTE
+  core tasks: Internationalized measures of learning and development for
+  children ages 5–12 years. *PsyArXiv*.
+  <https://doi.org/10.31234/osf.io/r4dhw_v1>
+
 Claude Code was used to help write and check these analyses.
