@@ -2514,6 +2514,157 @@ wave, where stable differences between children, which are much larger,
 dominate.</p>
 </div>
 </div>
+<div id="every-levante-task-at-leipzig" class="section level1">
+<h1>Every LEVANTE task at Leipzig</h1>
+<p>The study will administer the full LEVANTE battery, so the same
+calculation is worth running for every task with enough retested
+children. Tasks differ in two ways that matter: how stable children’s
+scores are (the ICC), and how fast scores grow with age, which sets how
+big a detectable effect is in everyday terms.</p>
+<p>Simulating all of them would take hours, so this section uses the
+formula for the standard error of the growth effect instead. The check
+below shows it reproduces the Vocabulary simulations.</p>
+<pre class="r"><code># the standard error of the growth effect, worked out from the expected information rather than
+# by simulation: G holds the variance of children&#39;s starting levels and growth rates,
+# last_wave_share splits children by the wave they are last tested at, and each group&#39;s
+# information is added up before being inverted
+growth_se_formula &lt;- function(n, icc, slope_sd = growth_sd, keep = retention) {
+  G &lt;- diag(c(icc, slope_sd^2))
+  last_wave_share &lt;- c(-diff(keep), keep[3])
+  info &lt;- matrix(0, 2, 2)
+  for (k in 1:3) {
+    A &lt;- cbind(1, 0:(k - 1))
+    V &lt;- A %*% G %*% t(A) + diag(1 - icc, k)
+    info &lt;- info + n * last_wave_share[k] * t(A) %*% solve(V) %*% A
+  }
+  sqrt(solve(info)[2, 2])
+}
+
+# compare the formula with the Vocabulary simulations already run, setting by setting:
+# rowwise runs the calculation one row at a time, and the two columns should agree
+# to within simulation error (about plus or minus .03)
+power_table |&gt;
+  rowwise() |&gt;
+  mutate(formula_power = pnorm(target_effect / growth_se_formula(n, icc) - qnorm(1 - alpha / 2))) |&gt;
+  ungroup() |&gt;
+  transmute(n, icc_used,
+            simulated_power = round(power, 3),
+            formula_power = round(formula_power, 3),
+            difference = round(power - formula_power, 3))</code></pre>
+<pre><code>## # A tibble: 9 × 5
+##       n icc_used simulated_power formula_power difference
+##   &lt;int&gt; &lt;chr&gt;              &lt;dbl&gt;         &lt;dbl&gt;      &lt;dbl&gt;
+## 1   300 estimate           0.63          0.661     -0.031
+## 2   320 estimate           0.705         0.689      0.016
+## 3   360 estimate           0.738         0.739     -0.001
+## 4   300 ci_low             0.562         0.583     -0.021
+## 5   320 ci_low             0.635         0.611      0.024
+## 6   360 ci_low             0.677         0.662      0.015
+## 7   300 ci_high            0.723         0.747     -0.024
+## 8   320 ci_high            0.787         0.773      0.014
+## 9   360 ci_high            0.828         0.82       0.008</code></pre>
+<pre class="r"><code># Leipzig scores for every task, from the data already loaded for the gap comparison
+leipzig_all &lt;- filter(all_tasks, dataset == &quot;pilot_mpieva_de_main&quot;)
+
+# tasks with at least 30 children tested more than once
+tasks_with_retests &lt;- leipzig_all |&gt;
+  group_by(task_id) |&gt;
+  summarise(retested = sum(table(user_id) &gt;= 2), .groups = &quot;drop&quot;) |&gt;
+  filter(retested &gt;= 30)
+
+# for each task: fit the ICC model, measure how fast scores grow with age, and work out
+# the smallest effect the study could detect
+task_table &lt;- bind_rows(lapply(tasks_with_retests$task_id, function(this_task) {
+
+  d &lt;- filter(leipzig_all, task_id == this_task)
+
+  # include the version term only where both versions appear for this task
+  f &lt;- if (n_distinct(d$adaptive) &gt; 1) {
+    score ~ splines::ns(age, df = 3) + adaptive + (1 | user_id)
+  } else {
+    score ~ splines::ns(age, df = 3) + (1 | user_id)
+  }
+  model &lt;- lmer(f, data = d)
+
+  # the two variance components, the ICC, and the SD of scores among same-age children
+  v &lt;- as.data.frame(VarCorr(model))
+  child_var &lt;- v$vcov[v$grp == &quot;user_id&quot;]
+  residual_var &lt;- v$vcov[v$grp == &quot;Residual&quot;]
+  icc &lt;- child_var / (child_var + residual_var)
+  within_sd &lt;- sqrt(child_var + residual_var)
+
+  # how fast scores rise with age: keep each child&#39;s first score, then regress on age
+  first_scores &lt;- d |&gt;
+    group_by(user_id) |&gt;
+    slice_min(age, n = 1, with_ties = FALSE) |&gt;
+    ungroup()
+  growth_per_year &lt;- coef(lm(score ~ age, data = first_scores))[[&quot;age&quot;]]
+
+  # the smallest detectable effect at each sample size, and what the N = 300 one is worth
+  # in months of ordinary growth accumulated by wave 3
+  mde &lt;- function(n) growth_se_formula(n, icc) * (qnorm(1 - alpha / 2) + qnorm(target_power))
+
+  tibble(task = this_task,
+         retested = sum(table(d$user_id) &gt;= 2),
+         icc = round(icc, 3),
+         within_age_sd = round(within_sd, 2),
+         growth_per_year = round(growth_per_year, 3),
+         error_share_of_residual = round(mean(d$score_se^2, na.rm = TRUE) / residual_var, 2),
+         mde_300 = round(mde(300), 3),
+         mde_360 = round(mde(360), 3),
+         months_by_wave_3_at_300 = round(2 * 12 * mde(300) * within_sd / growth_per_year, 1))
+}))
+
+# show the tasks, most sensitive first
+task_table |&gt; arrange(mde_300) |&gt; print(n = Inf, width = Inf)</code></pre>
+<pre><code>## # A tibble: 9 × 9
+##   task                     retested   icc within_age_sd growth_per_year
+##   &lt;chr&gt;                       &lt;int&gt; &lt;dbl&gt;         &lt;dbl&gt;           &lt;dbl&gt;
+## 1 egma-math                     164 0.658          1.31           0.678
+## 2 mental-rotation               128 0.553          0.88           0.226
+## 3 matrix-reasoning              149 0.483          1.48           0.412
+## 4 same-different-selection      153 0.464          1.26           0.128
+## 5 vocab                         162 0.463          0.65           0.269
+## 6 hearts-and-flowers            170 0.368          2.2            0.695
+## 7 theory-of-mind                145 0.369          0.7            0.147
+## 8 trog                          100 0.373          0.69           0.152
+## 9 memory-game                   156 0.312          0.66           0.175
+##   error_share_of_residual mde_300 mde_360 months_by_wave_3_at_300
+##                     &lt;dbl&gt;   &lt;dbl&gt;   &lt;dbl&gt;                   &lt;dbl&gt;
+## 1                    0.53   0.078   0.071                     3.6
+## 2                    0.81   0.087   0.08                      8.2
+## 3                    0.57   0.093   0.085                     8  
+## 4                    0.44   0.094   0.086                    22.3
+## 5                    1.06   0.094   0.086                     5.5
+## 6                    0.19   0.101   0.093                     7.7
+## 7                    1.54   0.101   0.093                    11.5
+## 8                    1.04   0.101   0.092                    11  
+## 9                    0.9    0.105   0.096                     9.5</code></pre>
+<p>How to read this:</p>
+<ul>
+<li><strong>Math is the most sensitive outcome.</strong> Its ICC of .66
+gives the smallest detectable effect, and because math grows quickly,
+that effect is worth only about three and a half months of development
+by wave 3.</li>
+<li><strong>Vocabulary is middling on the ICC but good in everyday
+terms</strong>, because its growth rate is healthy relative to its
+spread.</li>
+<li><strong>Slow-growing tasks are hard to interpret.</strong> Same and
+Different has an ICC close to Vocabulary’s, but grows so slowly that a
+detectable effect equals well over a year of development.</li>
+<li><strong>Executive function tasks are the weakest.</strong> Hearts
+and Flowers and Memory have the lowest ICCs.</li>
+<li><strong>The error share says what would help.</strong> Where it is
+near 1 (Vocabulary, TROG, Theory of Mind), the test-to-test variation is
+measurement imprecision, so a longer test would raise the ICC. Where it
+is low (Hearts and Flowers), children genuinely vary from day to day,
+and more items will not fix that.</li>
+</ul>
+<p>The ROAR reading tasks are missing here: Leipzig has too few children
+retested on them. They appear at Bogotá in the gap comparison above.</p>
+<p>These come from retests 3.6 months apart, so the annual-gap discount
+in the gap section applies to every task.</p>
+</div>
 <div id="reproducibility-check" class="section level1">
 <h1>Reproducibility check</h1>
 <p>Re-run the all-ages bootstrap with the same seed and confirm the
